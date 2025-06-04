@@ -2,6 +2,11 @@
 name = "iroh-gossip-discovery"
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+description = "Discover iroh nodes via iroh-gossip"
+homepage = "https://github.com/therishidesai/iroh-gossip-discovery"
+repository = "https://github.com/therishidesai/iroh-gossip-discovery"
+readme = "README.md"
 
 [dependencies]
 bytes = "1.10.1"
