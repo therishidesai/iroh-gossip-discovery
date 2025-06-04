@@ -1,7 +1,7 @@
 [package]
 name = "iroh-gossip-discovery"
-version = "0.2.0"
-edition = "2024"
+version = "0.3.0"
+edition = "2021"
 license = "MPL-2.0"
 description = "Discover iroh nodes via iroh-gossip"
 homepage = "https://github.com/therishidesai/iroh-gossip-discovery"
