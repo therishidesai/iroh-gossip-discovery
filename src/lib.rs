@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures::StreamExt;
 
 use iroh::NodeId;
@@ -10,13 +11,12 @@ use iroh_gossip::{
 
 use serde::{Deserialize, Serialize};
 
-use std::io::Cursor;
 use std::sync::Arc;
 use thiserror::Error;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, Instant, sleep};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Node {
@@ -31,6 +31,46 @@ pub struct NodeInfo {
     pub last_seen: Instant,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SignedMessage {
+    from: VerifyingKey,
+    data: Bytes,
+    signature: Signature,
+}
+
+impl SignedMessage {
+    pub fn sign_and_encode(secret_key: &SigningKey, node: &Node) -> Result<Bytes> {
+        let data: Bytes = postcard::to_stdvec(node)
+            .map_err(|e| GossipDiscoveryError::Serialization(e.to_string()))?
+            .into();
+        let signature = secret_key.sign(&data);
+        let from: VerifyingKey = secret_key.verifying_key();
+        
+        let signed_message = Self {
+            from,
+            data,
+            signature,
+        };
+        
+        let encoded = postcard::to_stdvec(&signed_message)
+            .map_err(|e| GossipDiscoveryError::Serialization(e.to_string()))?;
+        Ok(encoded.into())
+    }
+    
+    pub fn verify_and_decode(bytes: &[u8]) -> Result<(VerifyingKey, Node)> {
+        let signed_message: Self = postcard::from_bytes(bytes)
+            .map_err(|e| GossipDiscoveryError::Deserialization(e.to_string()))?;
+        let key: VerifyingKey = signed_message.from;
+        
+        key.verify(&signed_message.data, &signed_message.signature)
+            .map_err(|e| GossipDiscoveryError::SignatureVerification(e.to_string()))?;
+        
+        let node: Node = postcard::from_bytes(&signed_message.data)
+            .map_err(|e| GossipDiscoveryError::Deserialization(e.to_string()))?;
+        Ok((signed_message.from, node))
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum GossipDiscoveryError {
     #[error("Gossip error: {0}")]
@@ -41,6 +81,10 @@ pub enum GossipDiscoveryError {
     Serialization(String),
     #[error("Deserialization error: {0}")]
     Deserialization(String),
+    #[error("Signature verification error: {0}")]
+    SignatureVerification(String),
+    #[error("NodeId mismatch: expected {expected}, got {actual}")]
+    NodeIdMismatch { expected: NodeId, actual: NodeId },
 }
 
 pub type Result<T> = std::result::Result<T, GossipDiscoveryError>;
@@ -66,6 +110,7 @@ impl GossipDiscoveryBuilder {
         gossip: Gossip,
         topic_id: TopicId,
         peers: Vec<NodeId>,
+        endpoint: &iroh::Endpoint,
     ) -> Result<(GossipDiscoverySender, GossipDiscoveryReceiver)> {
         // - First node (empty peers): use subscribe() only  
         // - Other nodes (with peers): use subscribe_and_join()
@@ -81,7 +126,12 @@ impl GossipDiscoveryBuilder {
         let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
         let neighbor_map = Arc::new(DashMap::new());
 
-        let discovery_sender = GossipDiscoverySender { peer_rx, sender };
+        // Derive a secret key from the endpoint's node secret key
+        // This ensures the signing key corresponds to the node's identity
+        let node_secret = endpoint.secret_key();
+        let secret_key_bytes = node_secret.to_bytes();
+        let secret_key = SigningKey::from_bytes(&secret_key_bytes);
+        let discovery_sender = GossipDiscoverySender { peer_rx, sender, secret_key };
 
         let expiration_timeout = self.expiration_timeout.unwrap_or(Duration::from_secs(30));
 
@@ -102,6 +152,7 @@ impl GossipDiscoveryBuilder {
 pub struct GossipDiscoverySender {
     pub peer_rx: UnboundedReceiver<NodeId>,
     pub sender: GossipSender,
+    pub secret_key: SigningKey,
 }
 
 impl GossipDiscoverySender {
@@ -126,10 +177,8 @@ impl GossipDiscoverySender {
                 count: i,
             };
 
-            let mut msg = Vec::new();
-            ciborium::ser::into_writer(&update_node, &mut msg)
-                .map_err(|e| GossipDiscoveryError::Serialization(e.to_string()))?;
-            let bytes = Bytes::from(msg);
+            // Sign and encode the message
+            let bytes = SignedMessage::sign_and_encode(&self.secret_key, &update_node)?;
 
             if let Err(e) = self.sender.broadcast(bytes).await {
                 error!(%e, "Failed to broadcast");
@@ -153,8 +202,25 @@ impl GossipDiscoveryReceiver {
         while let Some(res) = self.receiver.next().await {
             match res {
                 Ok(Event::Gossip(GossipEvent::Received(msg))) => {
-                    let value: Node = ciborium::de::from_reader(&mut Cursor::new(msg.content))
-                        .map_err(|e| GossipDiscoveryError::Deserialization(e.to_string()))?;
+                    // Verify and decode the signed message
+                    let (verifying_key, value) = match SignedMessage::verify_and_decode(&msg.content) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            warn!(%e, "Failed to verify message signature, ignoring");
+                            continue;
+                        }
+                    };
+
+                    // Verify that the claimed node_id matches the public key
+                    let expected_node_id = NodeId::from(verifying_key);
+                    if value.node_id != expected_node_id {
+                        warn!(
+                            claimed_node_id = %value.node_id,
+                            actual_node_id = %expected_node_id,
+                            "NodeId spoofing attempt detected, ignoring message"
+                        );
+                        continue;
+                    }
 
                     let is_new_peer = !self.neighbor_map.contains_key(&value.name);
 

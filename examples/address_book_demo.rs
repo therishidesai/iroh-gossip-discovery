@@ -64,14 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(%seed_id, "Connecting to seed node");
         GossipDiscoveryBuilder::new()
             .with_expiration_timeout(Duration::from_secs(60))
-            .build_with_peers(gossip, topic_id, vec![seed_id])
+            .build_with_peers(gossip, topic_id, vec![seed_id], &endpoint)
             .await?
     } else {
         info!("Starting as first node - no existing peers to connect to");
         // For the first node, start with empty peer list - this will create the initial gossip network
         GossipDiscoveryBuilder::new()
             .with_expiration_timeout(Duration::from_secs(60))
-            .build_with_peers(gossip, topic_id, vec![])
+            .build_with_peers(gossip, topic_id, vec![], &endpoint)
             .await?
     };
 
