@@ -1649,11 +1649,14 @@ dependencies = [
  "bytes",
  "ciborium",
  "dashmap",
+ "futures",
  "iroh",
  "iroh-gossip",
  "serde",
  "thiserror 2.0.12",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

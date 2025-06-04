@@ -1,10 +1,6 @@
 /target
 .envrc
 .direnv/
+test_logs/
+result
 
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target

@@ -1,6 +1,8 @@
+use bytes::Bytes;
 use dashmap::DashMap;
+use futures::StreamExt;
 
-use iroh::{Endpoint, NodeId};
+use iroh::NodeId;
 use iroh_gossip::{
     net::{Event, Gossip, GossipEvent, GossipReceiver, GossipSender},
     proto::TopicId,
@@ -8,32 +10,92 @@ use iroh_gossip::{
 
 use serde::{Deserialize, Serialize};
 
+use std::io::Cursor;
 use std::sync::Arc;
+use thiserror::Error;
 
-use tokio::sync::{mpsc, mpsc::{UnboundedSender, UnboundedReceiver}};
-use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::time::{Duration, Instant, sleep};
+use tracing::{debug, error, info};
 
-
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Node {
     pub name: String,
     pub node_id: NodeId,
     pub count: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub node_id: NodeId,
+    pub last_seen: Instant,
+}
+
+#[derive(Error, Debug)]
+pub enum GossipDiscoveryError {
+    #[error("Gossip error: {0}")]
+    Gossip(#[from] iroh_gossip::net::Error),
+    #[error("Channel send error")]
+    ChannelSend,
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+}
+
+pub type Result<T> = std::result::Result<T, GossipDiscoveryError>;
 
 pub struct GossipDiscoveryBuilder {
-    
+    expiration_timeout: Option<Duration>,
 }
 
 impl GossipDiscoveryBuilder {
-    pub async fn init(gossip: Gossip, seed_id: NodeId, topic_id: TopicId) -> Result<(GossipDiscoverySender, GossipDiscoveryReceiver)> {
-	let (sender, mut receiver) = gossip
-            .subscribe_and_join(id, vec![seed_id])
-            .await?
-            .split();
-	
+    pub fn new() -> Self {
+        Self {
+            expiration_timeout: None,
+        }
+    }
+
+    pub fn with_expiration_timeout(mut self, timeout: Duration) -> Self {
+        self.expiration_timeout = Some(timeout);
+        self
+    }
+
+    pub async fn build_with_peers(
+        self,
+        gossip: Gossip,
+        topic_id: TopicId,
+        peers: Vec<NodeId>,
+    ) -> Result<(GossipDiscoverySender, GossipDiscoveryReceiver)> {
+        // - First node (empty peers): use subscribe() only  
+        // - Other nodes (with peers): use subscribe_and_join()
+        let (sender, receiver) = if peers.is_empty() {
+            // First node: use subscribe only (no peers to join)
+            let subscription = gossip.subscribe(topic_id, vec![])?;
+            subscription.split()
+        } else {
+            // Client node: use subscribe_and_join with peers
+            gossip.subscribe_and_join(topic_id, peers).await?.split()
+        };
+
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let neighbor_map = Arc::new(DashMap::new());
+
+        let discovery_sender = GossipDiscoverySender { peer_rx, sender };
+
+        let expiration_timeout = self.expiration_timeout.unwrap_or(Duration::from_secs(30));
+
+        let discovery_receiver = GossipDiscoveryReceiver {
+            neighbor_map: Arc::clone(&neighbor_map),
+            peer_tx,
+            receiver,
+            expiration_timeout,
+        };
+
+        // Start the cleanup task
+        GossipDiscoveryReceiver::start_cleanup_task(neighbor_map, expiration_timeout);
+
+        Ok((discovery_sender, discovery_receiver))
     }
 }
 
@@ -43,52 +105,157 @@ pub struct GossipDiscoverySender {
 }
 
 impl GossipDiscoverySender {
-    pub async fn gossip(&mut self, node: Node, update_rate: Duration) {
-	let mut i = node.count;
+    pub async fn gossip(&mut self, node: Node, update_rate: Duration) -> Result<()> {
+        let mut i = node.count;
 
-	loop {
-	    match self.peers_rx.try_recv() {
+        loop {
+            // Check for new peers to join
+            match self.peer_rx.try_recv() {
                 Ok(peer) => {
-                    self.sender.join_peers(vec![peer]).await;
+                    info!(%peer, "Joining new peer");
+                    if let Err(e) = self.sender.join_peers(vec![peer]).await {
+                        error!(%e, "Failed to join peer");
+                    }
                 }
                 Err(_) => {}
             }
 
-	    let update_node = Node {
-		name: node.name,
-		node_id: node.node_id,
-		count: i,
-	    };
+            let update_node = Node {
+                name: node.name.clone(),
+                node_id: node.node_id,
+                count: i,
+            };
 
-	    let mut msg = Vec::new();
-            ciborium::ser::into_writer(&update_node, &mut msg).expect("Serialization failed!");
-            let bytes = bytes::Bytes::from(msg);
-            let _ = self.sender.broadcast(bytes).await;
+            let mut msg = Vec::new();
+            ciborium::ser::into_writer(&update_node, &mut msg)
+                .map_err(|e| GossipDiscoveryError::Serialization(e.to_string()))?;
+            let bytes = Bytes::from(msg);
+
+            if let Err(e) = self.sender.broadcast(bytes).await {
+                error!(%e, "Failed to broadcast");
+            }
+
             i += 1;
             sleep(update_rate).await;
-	}
+        }
     }
 }
 
 pub struct GossipDiscoveryReceiver {
-    pub neighbor_map: Arc<DashMap<String, NodeId>>,
-    pub peer_tx: UnbounededSender<NodeId>,
-    pub receiver: GossipReceiver.
+    pub neighbor_map: Arc<DashMap<String, NodeInfo>>,
+    pub peer_tx: UnboundedSender<NodeId>,
+    pub receiver: GossipReceiver,
+    pub expiration_timeout: Duration,
 }
 
 impl GossipDiscoveryReceiver {
-    pub async fn update_map(&mut self) {
-	while let Some(res) = self.receiver.next().await {
-            if let Event::Gossip(GossipEvent::Received(msg)) = res? {
-		let value: Node = ciborium::de::from_reader(&mut Cursor::new(msg.content))
-                    .expect("Deserialization failed!");
-		if !self.neighbor_map.contains_key(&value.name) {
-		    // TODO: only send peers when we lose a neighbor so we dont broadcast as much
-                    peers_tx.send(value.node_id.clone())?;
-		}
-		self.neighbor_map.insert(value.name, value.node_id);
-                eprintln!("Address Book: \n {:?}", address_book);
+    pub async fn update_map(&mut self) -> Result<()> {
+        while let Some(res) = self.receiver.next().await {
+            match res {
+                Ok(Event::Gossip(GossipEvent::Received(msg))) => {
+                    let value: Node = ciborium::de::from_reader(&mut Cursor::new(msg.content))
+                        .map_err(|e| GossipDiscoveryError::Deserialization(e.to_string()))?;
+
+                    let is_new_peer = !self.neighbor_map.contains_key(&value.name);
+
+                    if is_new_peer {
+                        // Send new peer to sender for joining
+                        self.peer_tx
+                            .send(value.node_id)
+                            .map_err(|_| GossipDiscoveryError::ChannelSend)?;
+                        info!(name = %value.name, node_id = %value.node_id, "Discovered new peer");
+                    }
+
+                    self.neighbor_map.insert(
+                        value.name.clone(),
+                        NodeInfo {
+                            node_id: value.node_id,
+                            last_seen: Instant::now(),
+                        },
+                    );
+                    debug!(peer_count = self.neighbor_map.len(), "Address book updated");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(%e, "Error receiving gossip");
+                }
             }
-	}
+        }
+        Ok(())
+    }
+
+    pub fn get_neighbors(&self) -> Vec<(String, NodeId)> {
+        self.neighbor_map
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().node_id))
+            .collect()
+    }
+
+    pub fn cleanup_expired_nodes(&self) -> usize {
+        let now = Instant::now();
+        let mut expired_count = 0;
+
+        // Collect expired node names first to avoid holding locks
+        let expired_nodes: Vec<String> = self
+            .neighbor_map
+            .iter()
+            .filter_map(|entry| {
+                if now.duration_since(entry.value().last_seen) > self.expiration_timeout {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove expired nodes
+        for node_name in expired_nodes {
+            if let Some((_, node_info)) = self.neighbor_map.remove(&node_name) {
+                info!(name = %node_name, node_id = %node_info.node_id, "Expired node");
+                expired_count += 1;
+            }
+        }
+
+        expired_count
+    }
+
+    pub fn start_cleanup_task(
+        neighbor_map: Arc<DashMap<String, NodeInfo>>,
+        expiration_timeout: Duration,
+    ) {
+        let cleanup_interval = expiration_timeout / 3; // Check every 1/3 of timeout period
+
+        tokio::spawn(async move {
+            loop {
+                sleep(cleanup_interval).await;
+
+                let now = Instant::now();
+                let mut expired_count = 0;
+
+                // Collect expired node names first to avoid holding locks
+                let expired_nodes: Vec<String> = neighbor_map
+                    .iter()
+                    .filter_map(|entry| {
+                        if now.duration_since(entry.value().last_seen) > expiration_timeout {
+                            Some(entry.key().clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Remove expired nodes
+                for node_name in expired_nodes {
+                    if let Some((_, node_info)) = neighbor_map.remove(&node_name) {
+                        info!(name = %node_name, node_id = %node_info.node_id, "Expired node");
+                        expired_count += 1;
+                    }
+                }
+
+                if expired_count > 0 {
+                    info!(count = expired_count, "Cleaned up expired nodes");
+                }
+            }
+        });
     }
 }
