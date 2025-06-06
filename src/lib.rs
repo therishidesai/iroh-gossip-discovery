@@ -156,6 +156,20 @@ pub struct GossipDiscoverySender {
 }
 
 impl GossipDiscoverySender {
+    /// Add external peers to the gossip network
+    pub async fn add_peers(&mut self, peers: Vec<NodeId>) -> Result<()> {
+        if !peers.is_empty() {
+            info!(peer_count = peers.len(), "Adding external peers to gossip network");
+            self.sender.join_peers(peers).await?;
+        }
+        Ok(())
+    }
+
+    /// Add a single external peer to the gossip network  
+    pub async fn add_peer(&mut self, peer: NodeId) -> Result<()> {
+        self.add_peers(vec![peer]).await
+    }
+
     pub async fn gossip(&mut self, node: Node, update_rate: Duration) -> Result<()> {
         let mut i = node.count;
 
