@@ -114,14 +114,9 @@ impl GossipDiscoveryBuilder {
     ) -> Result<(GossipDiscoverySender, GossipDiscoveryReceiver)> {
         // - First node (empty peers): use subscribe() only  
         // - Other nodes (with peers): use subscribe_and_join()
-        let (sender, receiver) = if peers.is_empty() {
-            // First node: use subscribe only (no peers to join)
-            let subscription = gossip.subscribe(topic_id, vec![])?;
-            subscription.split()
-        } else {
-            // Client node: use subscribe_and_join with peers
-            gossip.subscribe_and_join(topic_id, peers).await?.split()
-        };
+        info!("Attempting to subscribe to gossip topic");
+        let (sender, receiver) = gossip.subscribe(topic_id, peers)?.split();
+        info!("Subscribed to gossip topic");
 
         let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
         let neighbor_map = Arc::new(DashMap::new());
