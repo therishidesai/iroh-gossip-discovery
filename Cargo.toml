@@ -15,7 +15,8 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 futures = "0.3"
 iroh = { git = "https://github.com/therishidesai/iroh.git", branch = "feat/multi-interface-mdns", features = ["discovery-local-network"] }
-iroh-gossip = "0.35.0"
+iroh-gossip = { git = "https://github.com/therishidesai/iroh-gossip.git", branch = "rdesai/multi-interface-mdns"}
+#iroh-gossip = "0.35.0"
 postcard = { version = "1.0", features = ["alloc"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
