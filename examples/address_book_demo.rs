@@ -1,11 +1,11 @@
-use iroh::NodeId;
+use iroh_base::EndpointId;
 use iroh_gossip::{net::Gossip, proto::TopicId};
 use iroh_gossip_discovery::{GossipDiscoveryBuilder, Node};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
-use tracing::{info, error};
+use tokio::time::{sleep, Duration};
+use tracing::{error, info};
 use tracing_subscriber;
 
 #[tokio::main]
@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "iroh_gossip_discovery=info".into())
+                .unwrap_or_else(|_| "iroh_gossip_discovery=info".into()),
         )
         .init();
 
@@ -33,27 +33,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_name = args[1].clone();
     let seed_node_id = if args.len() > 2 {
-        Some(NodeId::from_str(&args[2])?)
+        Some(EndpointId::from_str(&args[2])?)
     } else {
         None
     };
 
     // Create endpoint and gossip (with discovery enabled like the working example)
     let endpoint = iroh::Endpoint::builder()
-        .discovery_n0()
-        .discovery_local_network()
+        .discovery(iroh::discovery::dns::DnsDiscovery::n0_dns())
+        .discovery(iroh::discovery::mdns::MdnsDiscovery::builder())
         .bind()
         .await?;
-    info!(name = %node_name, node_id = %endpoint.node_id(), "Node started");
+    info!(name = %node_name, node_id = %endpoint.id(), "Node started");
 
-    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
-    
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+
     // Set up the router with gossip ALPN (required for gossip protocol)
     use iroh::protocol::Router;
     let _router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
-    
+
     let topic_id = TopicId::from([
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32,
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node = Node {
         name: node_name.clone(),
-        node_id: endpoint.node_id(),
+        node_id: endpoint.id(),
         count: 0,
     };
 
