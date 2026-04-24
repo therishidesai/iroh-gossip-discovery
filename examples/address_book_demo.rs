@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "iroh_gossip_discovery=info".into())
+                .unwrap_or_else(|_| "iroh_gossip_discovery=info,address_book_demo=info".into())
         )
         .init();
 
