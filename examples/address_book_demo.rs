@@ -1,12 +1,34 @@
-use iroh::NodeId;
+use futures::StreamExt;
+use iroh::{Endpoint, EndpointId, RelayMode, SecretKey, address_lookup::DnsAddressLookup, dns::DnsResolver};
 use iroh_gossip::{net::Gossip, proto::TopicId};
 use iroh_gossip_discovery::{GossipDiscoveryBuilder, Node};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use tracing::{info, error};
+use tracing::{error, info, trace};
 use tracing_subscriber;
+#[derive(Debug, Copy, Clone, Default)]
+pub struct LocalDiscoveryPreset;
+
+impl iroh::endpoint::presets::Preset for LocalDiscoveryPreset {
+    fn apply(
+        self,
+        mut builder: iroh::endpoint::Builder,
+    ) -> iroh::endpoint::Builder {
+
+        builder = builder.crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
+        
+        use iroh::RelayMode;
+        builder = builder.relay_mode(RelayMode::Disabled);
+
+        use iroh::address_lookup::MdnsAddressLookup;
+        builder = builder.address_lookup(MdnsAddressLookup::builder());
+
+
+        builder
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,20 +55,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_name = args[1].clone();
     let seed_node_id = if args.len() > 2 {
-        Some(NodeId::from_str(&args[2])?)
+        Some(EndpointId::from_str(&args[2])?)
     } else {
         None
     };
 
-    // Create endpoint and gossip (with discovery enabled like the working example)
-    let endpoint = iroh::Endpoint::builder()
-        .discovery_n0()
-        .discovery_local_network()
-        .bind()
-        .await?;
-    info!(name = %node_name, node_id = %endpoint.node_id(), "Node started");
+    let secret_key = SecretKey::generate();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key.to_bytes());
 
-    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+    let mut builder = Endpoint::builder(LocalDiscoveryPreset)
+        .secret_key(secret_key.clone())
+        .relay_mode(RelayMode::Disabled);
+
+    let endpoint = builder.bind().await?;
+
+    let mdns = iroh::address_lookup::mdns::MdnsAddressLookup::builder().advertise(true).build(endpoint.id()).unwrap();
+    endpoint.address_lookup()?.add(mdns.clone());
+    
+    
+    let _mdns_handle = tokio::spawn(async move {
+        let mut events = mdns.subscribe().await;
+        while let Some(event) = events.next().await {
+            trace!("[MDNS] {:?}", event);
+        }
+    });
+    
+
+    info!(name = %node_name, node_id = %endpoint.id(), "Node started");
+
+    //let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
+     let gossip = Gossip::builder().spawn(endpoint.clone());
     
     // Set up the router with gossip ALPN (required for gossip protocol)
     use iroh::protocol::Router;
@@ -77,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node = Node {
         name: node_name.clone(),
-        node_id: endpoint.node_id(),
+        node_id: endpoint.id(),
         count: 0,
     };
 
